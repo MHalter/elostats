@@ -1,22 +1,31 @@
-// eloextplugin
+// elostats
 
-package eloextplugin
+package elostats
 
 import (
 	"context"
-	"math/rand"
+	"database/sql"
+	"fmt"
 	"time"
 
+	_ "github.com/denisenkom/go-mssqldb"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-type EloPerfData struct {
-	ValueName       string          `toml:"value_name"`
-	Min             int64           `toml:"min"`
-	Max             int64           `toml:"max"`
+type SQLMetric struct {
+	Query      string `toml:"query"`
+	MetricName string `toml:"metric_name"`
+}
+
+type ELOData struct {
 	SampleFrequency config.Duration `toml:"sample_frequency"`
+	DBHost          string          `toml:"DBHost"`
+	DBName          string          `toml:"DBName"`
+	DBUser          string          `toml:"DBUser"`
+	DBPassword      string          `toml:"DBPassword"`
+	SQLMetrics      []SQLMetric     `toml:"sql_metrics"`
 	ctx             context.Context
 	cancel          context.CancelFunc
 
@@ -24,84 +33,95 @@ type EloPerfData struct {
 }
 
 func init() {
-	inputs.Add("eloextplugin", func() telegraf.Input {
-		return &EloPerfData{
-			ValueName:       "checkoutSord",
-			Min:             0,
-			Max:             100,
-			SampleFrequency: config.Duration(1 * time.Second),
+	inputs.Add("elostats", func() telegraf.Input {
+		return &ELOData{
+			SampleFrequency: config.Duration(5 * time.Second),
 		}
 	})
 }
 
-func (r *EloPerfData) Init() error {
+func (r *ELOData) Init() error {
 	return nil
 }
 
-func (r *EloPerfData) SampleConfig() string {
+func (r *ELOData) SampleConfig() string {
 	r.Log.Infof("SampleConfig called")
 	return `
-  ## Generates random numbers
-	[inputs.eloextplugin]
-	# the name of the measurement to write out to.
-	# value_name = "checkoutSord"
-	# min = 0
-	# max = 100
-	# sample_frequency = "1s"
+	[[inputs.elostats]]
+	# Sample frequency
+	sample_frequency = "5s"
+	# MSSQL Database Host
+	DBHost = "localhost"
+	# MSSQL Database Name
+	DBName = "database"
+	# MSSQL Database User
+	DBUser = "user"
+	# MSSQL Database Password
+	DBPassword = "password"
+	
+	# List of SQL queries and associated metric names
+	[[inputs.elostats.sql_metrics]]
+	query = "SELECT count(*) FROM dbo.workflowactivedoc where wf_nodeid = 0"
+	metric_name = "WFCount"
+
+	[[inputs.elostats.sql_metrics]]
+	query = "SELECT max(objid) FROM dbo.objekte"
+	metric_name = "MaxObjID"
 `
 }
 
-func (r *EloPerfData) Description() string {
-	return "Generates a random number"
+func (r *ELOData) Description() string {
+	return "Connects to MSSQL database, executes queries, and sends the results to InfluxDB"
 }
 
-func (r *EloPerfData) Gather(a telegraf.Accumulator) error {
+func (r *ELOData) Gather(a telegraf.Accumulator) error {
 	ticker := time.NewTicker(time.Duration(r.SampleFrequency))
 	defer ticker.Stop()
 
 	for range ticker.C {
-		r.sendMetric(a)
+		for _, sqlMetric := range r.SQLMetrics {
+			value, err := r.executeQuery(sqlMetric.Query)
+			if err != nil {
+				return fmt.Errorf("Error executing query: %s", err)
+			}
+
+			r.sendMetric(a, value, sqlMetric.MetricName)
+		}
 	}
 
 	return nil
 }
 
-// // provide the extra functions so we can also run as a service input.
-// func (r *RandomNumberGenerator) Start(a telegraf.Accumulator) error {
-// 	println("Started as service")
-// 	r.ctx, r.cancel = context.WithCancel(context.Background())
-// 	go func() {
-// 		t := time.NewTicker(r.SampleFrequency)
-// 		for {
-// 			select {
-// 			case <-r.ctx.Done():
-// 				t.Stop()
-// 				return
-// 			case <-t.C:
-// 				r.sendMetric(a)
-// 			}
-// 		}
-// 	}()
-// 	return nil
-// }
+func (r *ELOData) executeQuery(query string) (int, error) {
+	connString := fmt.Sprintf("server=%s;user id=%s;password=%s;database=%s",
+		r.DBHost, r.DBUser, r.DBPassword, r.DBName)
 
-func (r *EloPerfData) Stop() {
-	r.cancel()
+	db, err := sql.Open("sqlserver", connString)
+	if err != nil {
+		return 0, fmt.Errorf("Error opening database connection: %s", err)
+	}
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var value int
+	err = db.QueryRowContext(ctx, query).Scan(&value)
+	if err != nil {
+		return 0, fmt.Errorf("Error executing query: %s", err)
+	}
+
+	return value, nil
 }
 
-func (r *EloPerfData) sendMetric(a telegraf.Accumulator) {
-	n := rand.Int63n(r.Max-r.Min) + r.Min
-
-	tags := map[string]string{
-		"host":   "your_host",
-		"metric": r.ValueName,
-	}
-
-	fields := map[string]interface{}{
-		r.ValueName: n,
-	}
-
+func (r *ELOData) sendMetric(a telegraf.Accumulator, value int, metricName string) {
+	// Send the result to InfluxDB
+	tags := map[string]string{"metric": metricName}
+	fields := map[string]interface{}{"value": value}
 	now := time.Now()
+	a.AddFields("elostats", fields, tags, now)
+}
 
-	a.AddFields("measurement_name", fields, tags, now)
+func (r *ELOData) Stop() {
+	r.cancel()
 }
